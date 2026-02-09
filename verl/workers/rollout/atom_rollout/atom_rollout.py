@@ -27,7 +27,17 @@ logger = logging.getLogger(__file__)
 logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
-class ATOMAsyncRollout(BaseRollout):
+class ServerAdapter(BaseRollout):
+    """ATOM server adapter used in native async mode.
+
+    Unlike vLLM/SGLang/TRT-LLM ServerAdapters which act as lightweight clients
+    to a remote server, ATOM's ServerAdapter directly holds the LLMEngine in
+    the worker process and communicates with ATOMHttpServer via ZeroMQ RPC.
+    This enables efficient direct weight loading without IPC serialization.
+
+    - hybrid mode: holds the ATOM LLMEngine, handles weight sync and generation.
+    - standalone/colocated mode: placeholder to occupy the GPU.
+    """
 
     _RPC_METHOD_MAP = {
         "init_worker": "_init_worker",
@@ -97,7 +107,7 @@ class ATOMAsyncRollout(BaseRollout):
                 result = await self._execute_method(method, *args, **kwargs)
                 await self.socket.send(pickle.dumps(result))
             except Exception as e:
-                logger.exception(f"ATOMAsyncRollout _loop_forever error: {e}")
+                logger.exception(f"ATOM ServerAdapter _loop_forever error: {e}")
                 await self.socket.send(pickle.dumps(e))
                 break
 
@@ -271,7 +281,7 @@ class ATOMAsyncRollout(BaseRollout):
     def generate_sequences(self, prompts: DataProto) -> DataProto:
         """Not supported in async mode."""
         raise NotImplementedError(
-            "ATOMAsyncRollout does not support synchronous generate_sequences(). "
+            "ATOM ServerAdapter does not support synchronous generate_sequences(). "
             "Please use the async server interface via ATOMReplica and ATOMHttpServer."
         )
 
@@ -286,7 +296,7 @@ class ATOMAsyncRollout(BaseRollout):
             return
         self._is_shutdown = True
         
-        logger.info("ATOMAsyncRollout shutting down...")
+        logger.info("ATOM ServerAdapter shutting down...")
         
         if hasattr(self, 'inference_engine') and self.inference_engine is not None:
             try:
@@ -302,7 +312,7 @@ class ATOMAsyncRollout(BaseRollout):
                 logger.warning(f"Error closing ZMQ socket: {e}")
             self.socket = None
         
-        logger.info("ATOMAsyncRollout shutdown complete")
+        logger.info("ATOM ServerAdapter shutdown complete")
 
     def __del__(self):
         try:

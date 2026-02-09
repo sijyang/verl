@@ -1,6 +1,6 @@
 from importlib.metadata import PackageNotFoundError, version
 
-from .atom_rollout import ATOMAsyncRollout
+from .atom_rollout import ServerAdapter
 from .atom_async_server import ATOMReplica, ATOMHttpServer
 from .constants import ATOMDefaults, SleepLevel
 
@@ -21,7 +21,7 @@ if atom_package_version is None:
     )
 
 __all__ = [
-    "ATOMAsyncRollout",
+    "ServerAdapter",
     "ATOMReplica",
     "ATOMHttpServer",
     "ATOMDefaults",
