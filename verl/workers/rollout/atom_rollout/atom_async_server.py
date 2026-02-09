@@ -19,7 +19,7 @@ from verl.workers.rollout.utils import (
     is_valid_ipv6_address,
     run_unvicorn,
 )
-from verl.workers.rollout.atom_rollout.atom_rollout import ATOMAsyncRollout
+from verl.workers.rollout.atom_rollout.atom_rollout import ServerAdapter
 from verl.workers.rollout.atom_rollout.constants import ATOMDefaults
 
 if TYPE_CHECKING:
@@ -419,7 +419,7 @@ class ATOMHttpServer:
 
 
 # Ray remote worker class
-_rollout_worker_actor_cls = ray.remote(ATOMAsyncRollout)
+_rollout_worker_actor_cls = ray.remote(ServerAdapter)
 
 
 class ATOMReplica(RolloutReplica):
