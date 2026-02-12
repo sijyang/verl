@@ -13,10 +13,9 @@ from verl.single_controller.ray import RayClassWithInitArgs
 from verl.utils.config import omega_conf_to_dataclass
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.replica import RolloutMode, RolloutReplica, TokenOutput
+from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.workers.rollout.utils import (
-    get_free_port,
     get_max_position_embeddings,
-    is_valid_ipv6_address,
     run_unvicorn,
 )
 from verl.workers.rollout.atom_rollout.atom_rollout import ServerAdapter
@@ -142,8 +141,17 @@ class ATOMHttpServer:
             self._master_address = master_address
             self._master_port = master_port
 
-        # 1. Get worker ZMQ address
-        zmq_address = await self.workers[0].get_zeromq_address.remote()
+        # 1. Get worker ZMQ address.
+        # workers[0] is a WorkerDict Ray actor wrapping multiple colocated workers
+        # (e.g. actor_rollout + critic). We reach into worker_dict to find the one
+        # that holds the ATOM ServerAdapter rollout and retrieve its ZMQ address.
+        zmq_address = await self.workers[0].__ray_call__.remote(
+            lambda wd: next(
+                w.rollout.get_zeromq_address()
+                for w in wd.worker_dict.values()
+                if hasattr(w, 'rollout')
+            )
+        )
         logger.info(
             f"ATOMHttpServer replica={self.replica_rank}, node={self.node_rank}: "
             f"worker ZMQ address: {zmq_address}"
@@ -390,25 +398,26 @@ class ATOMHttpServer:
         return await future
 
     async def wake_up(self):
-        if self.rollout_mode == RolloutMode.HYBRID:
-            # Call all workers to switch between trainer mode and rollout mode.
-            await asyncio.gather(*[worker.wake_up.remote() for worker in self.workers])
-        elif self.rollout_mode == RolloutMode.COLOCATED:
-            # Directly call engine to wake up without sync weights.
+        if self.rollout_mode in (RolloutMode.HYBRID, RolloutMode.COLOCATED):
+            # Resume ATOM engine memory via ZMQ (weights + KV cache).
+            # In HYBRID mode, actual weight sync is handled separately via update_weights.
             if self.executor:
-                self.executor.rpc("broadcast_utility_command", "resume_memory", tags=["kv_cache", "weights"])
+                self.executor.rpc("broadcast_utility_command", "resume_memory",
+                                  tags=["kv_cache", "weights"])
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip wake_up in standalone mode")
 
     async def sleep(self):
-        if self.rollout_mode == RolloutMode.HYBRID:
-            # Clear KV cache before sleep
-            await self.clear_kv_cache()
-            await asyncio.gather(*[worker.sleep.remote() for worker in self.workers])
-        elif self.rollout_mode == RolloutMode.COLOCATED:
+        if self.rollout_mode in (RolloutMode.HYBRID, RolloutMode.COLOCATED):
+            # Clear KV cache, then release memory via ZMQ so FSDP can use the GPU.
             await self.clear_kv_cache()
             if self.executor:
-                self.executor.rpc("broadcast_utility_command", "release_memory", tags=["kv_cache"])
+                self.executor.rpc("broadcast_utility_command", "release_memory",
+                                  tags=["kv_cache"])
+                if self.rollout_mode == RolloutMode.HYBRID:
+                    # HYBRID: also release weights since FSDP will reload them on wake_up
+                    self.executor.rpc("broadcast_utility_command", "release_memory",
+                                      tags=["weights"])
         elif self.rollout_mode == RolloutMode.STANDALONE:
             logger.info("skip sleep in standalone mode")
 

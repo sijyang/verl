@@ -20,7 +20,7 @@ from verl.utils.distributed import initialize_global_process_group_ray
 from verl.utils.ray_utils import ray_noset_visible_devices
 from verl.workers.config import HFModelConfig, RolloutConfig
 from verl.workers.rollout.base import BaseRollout
-from verl.workers.rollout.utils import get_free_port, is_valid_ipv6_address
+from verl.utils.net_utils import get_free_port, is_valid_ipv6_address
 from verl.workers.rollout.atom_rollout.constants import ATOMDefaults, SleepLevel
 
 logger = logging.getLogger(__file__)
@@ -274,7 +274,9 @@ class ServerAdapter(BaseRollout):
                 pass
             return
         
-        self.inference_engine.load_weights(weights)
+        atom_kwargs = getattr(self.config, "engine_kwargs", {}).get("atom", {}) or {}
+        bucket_size_mb = atom_kwargs.get("bucket_size_mb", 2048)
+        self.inference_engine.load_weights(weights, bucket_size_mb=bucket_size_mb)
         
         logger.info("ATOM weight update completed")
 
