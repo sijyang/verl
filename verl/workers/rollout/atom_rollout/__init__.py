@@ -5,20 +5,16 @@ from .atom_async_server import ATOMReplica, ATOMHttpServer
 from .constants import ATOMDefaults, SleepLevel
 
 
-def get_version(pkg):
+def ensure_atom_installed():
+    """Check that the 'atom' package is installed. Raises PackageNotFoundError if not."""
     try:
-        return version(pkg)
+        version("atom")
     except PackageNotFoundError:
-        return None
+        raise PackageNotFoundError(
+            "To use ATOM rollout, please ensure the 'atom' package is properly installed. "
+            "See ATOM documentation for installation instructions."
+        ) from None
 
-
-atom_package_name = "atom"
-atom_package_version = get_version(atom_package_name)
-if atom_package_version is None:
-    raise PackageNotFoundError(
-        "To use ATOM rollout, please ensure the 'atom' package is properly installed. "
-        "See ATOM documentation for installation instructions."
-    )
 
 __all__ = [
     "ServerAdapter",
@@ -26,4 +22,5 @@ __all__ = [
     "ATOMHttpServer",
     "ATOMDefaults",
     "SleepLevel",
+    "ensure_atom_installed",
 ]
