@@ -323,7 +323,7 @@ class RolloutConfig(BaseConfig):
                 )
 
         if self.pipeline_model_parallel_size > 1:
-            if self.name == "vllm" or self.name == "sglang" or self.name == "trtllm":
+            if self.name == "vllm" or self.name == "sglang" or self.name == "trtllm" or self.name == "atom":
                 raise NotImplementedError(
                     f"Current rollout {self.name=} not implemented pipeline_model_parallel_size > 1 yet."
                 )
