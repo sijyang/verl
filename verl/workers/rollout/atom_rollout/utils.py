@@ -11,7 +11,9 @@ def get_device_uuid(device_id: int) -> str:
     try:
         result = subprocess.run(
             ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader"],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         )
         uuids = result.stdout.strip().split("\n")
         cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
@@ -25,10 +27,18 @@ def get_device_uuid(device_id: int) -> str:
     try:
         result = subprocess.run(
             ["rocm-smi", "--showuniqueid", "--csv"],
-            capture_output=True, text=True, check=True,
+            capture_output=True,
+            text=True,
+            check=True,
         )
-        lines = [l for l in result.stdout.strip().split("\n") if l and not l.startswith("device")]
-        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES") or os.environ.get("ROCR_VISIBLE_DEVICES")
+        lines = [
+            l
+            for l in result.stdout.strip().split("\n")
+            if l and not l.startswith("device")
+        ]
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES") or os.environ.get(
+            "ROCR_VISIBLE_DEVICES"
+        )
         if cuda_visible:
             visible = [int(d) for d in cuda_visible.split(",")]
             idx = visible[device_id]
@@ -58,15 +68,14 @@ def deserialize_tensors(data: bytes) -> List[Tuple[str, torch.Tensor]]:
 
 
 def get_named_tensor_buckets(
-    iterable: Iterator[Tuple[str, torch.Tensor]],
-    bucket_bytes: int
+    iterable: Iterator[Tuple[str, torch.Tensor]], bucket_bytes: int
 ) -> Iterator[List[Tuple[str, torch.Tensor]]]:
     if bucket_bytes <= 0:
         raise ValueError(f"bucket_bytes must be greater than 0, got {bucket_bytes}")
 
     current_bucket = []
     current_size = 0
-    
+
     for name, tensor in iterable:
         tensor_size = tensor.element_size() * tensor.numel()
         if current_size + tensor_size > bucket_bytes:

@@ -1,6 +1,6 @@
 class SleepLevel:
     RELEASE_KV_CACHE_ONLY = 1  # Release KV cache only
-    RELEASE_ALL = 2            # Release KV cache and model weights
+    RELEASE_ALL = 2  # Release KV cache and model weights
 
 
 class IPCConfig:

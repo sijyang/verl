@@ -21,7 +21,11 @@ from verl.workers.rollout.utils import (
     get_max_position_embeddings,
     run_uvicorn,
 )
-from verl.workers.rollout.atom_rollout.constants import ATOMDefaults, IPCConfig, SleepLevel
+from verl.workers.rollout.atom_rollout.constants import (
+    ATOMDefaults,
+    IPCConfig,
+    SleepLevel,
+)
 from verl.workers.rollout.atom_rollout.utils import get_device_uuid
 
 logger = logging.getLogger(__name__)
@@ -50,7 +54,9 @@ class ATOMHttpServer:
         )
 
         if self.config.max_model_len is None or self.config.max_model_len <= 0:
-            self.config.max_model_len = get_max_position_embeddings(self.model_config.hf_config)
+            self.config.max_model_len = get_max_position_embeddings(
+                self.model_config.hf_config
+            )
 
         self.rollout_mode = rollout_mode
         self.workers = workers
@@ -109,6 +115,7 @@ class ATOMHttpServer:
 
         engine_kwargs = self._build_engine_kwargs()
         from atom.rollout.async_engine import AsyncLLMEngine
+
         self.engine = AsyncLLMEngine(**engine_kwargs)
         logger.info("ATOMHttpServer: AsyncLLMEngine created")
 
@@ -126,8 +133,9 @@ class ATOMHttpServer:
         unsupported_keys = ("top_p", "top_k", "repetition_penalty", "max_new_tokens")
         for key in unsupported_keys:
             if key in sampling_params:
-                logger.debug(f"Dropping unsupported sampling param: {key}={sampling_params.pop(key)}")
-
+                logger.debug(
+                    f"Dropping unsupported sampling param: {key}={sampling_params.pop(key)}"
+                )
 
         return SamplingParams(
             max_tokens=max_tokens,
@@ -197,10 +205,14 @@ class ATOMHttpServer:
         self._server_port, self._server_task = await run_uvicorn(
             app, None, self._server_address
         )
-        logger.info(f"HTTP server started at {self._server_address}:{self._server_port}")
+        logger.info(
+            f"HTTP server started at {self._server_address}:{self._server_port}"
+        )
 
         self._batch_processor_task = asyncio.create_task(self._batch_processor_loop())
-        logger.info(f"Batch processor started with batch_size={self._batch_size}, timeout={self._batch_timeout}s")
+        logger.info(
+            f"Batch processor started with batch_size={self._batch_size}, timeout={self._batch_timeout}s"
+        )
 
     async def _batch_processor_loop(self):
         """Background task that processes batched requests."""
@@ -271,7 +283,11 @@ class ATOMHttpServer:
                     token_ids = output.get("token_ids", [])
                     log_probs = output.get("logprobs", None)
                     finish_reason = output.get("finish_reason", "stop")
-                    stop_reason = "completed" if finish_reason in ("stop", "length") else finish_reason
+                    stop_reason = (
+                        "completed"
+                        if finish_reason in ("stop", "length")
+                        else finish_reason
+                    )
 
                     result = TokenOutput(
                         token_ids=token_ids,
@@ -281,7 +297,9 @@ class ATOMHttpServer:
                     )
                     future.set_result(result)
                 else:
-                    future.set_exception(RuntimeError(f"Missing output for request {i}"))
+                    future.set_exception(
+                        RuntimeError(f"Missing output for request {i}")
+                    )
 
         except Exception as e:
             logger.error(f"Batch processing error: {e}", exc_info=True)
@@ -299,7 +317,9 @@ class ATOMHttpServer:
     ) -> TokenOutput:
         """Generate sequence with batch collection for DP parallelism."""
         if image_data or video_data:
-            logger.warning("ATOM does not support multimodal inputs. image_data/video_data will be ignored.")
+            logger.warning(
+                "ATOM does not support multimodal inputs. image_data/video_data will be ignored."
+            )
 
         sp = self._build_sampling_params(sampling_params)
 
@@ -466,14 +486,18 @@ class ATOMHttpServer:
         else:
             # SHM fallback: collect all weights to GPU, then use engine.load_weights()
             shm = shared_memory.SharedMemory(name=comm_metadata["name"])
-            buffer = torch.frombuffer(shm.buf[:comm_metadata["size"]], dtype=torch.uint8)
+            buffer = torch.frombuffer(
+                shm.buf[: comm_metadata["size"]], dtype=torch.uint8
+            )
             all_weights = []
             while True:
                 metadata = socket.recv_pyobj()
                 for name, meta in metadata["bucket_meta"].items():
                     shape, dtype, offset = meta["shape"], meta["dtype"], meta["offset"]
                     nbytes = dtype.itemsize * torch.Size(shape).numel()
-                    tensor = buffer[offset:offset + nbytes].view(dtype=dtype).view(shape)
+                    tensor = (
+                        buffer[offset : offset + nbytes].view(dtype=dtype).view(shape)
+                    )
                     tensor = tensor.to("cuda:0")
                     all_weights.append((name, tensor))
                 torch.cuda.synchronize()
@@ -486,9 +510,15 @@ class ATOMHttpServer:
             del buffer
             shm.close()
 
-            atom_kwargs = (getattr(self.config, "engine_kwargs", {}) or {}).get("atom", {}) or {}
-            bucket_size_mb = atom_kwargs.get("bucket_size_mb", IPCConfig.DEFAULT_BUCKET_SIZE_MB)
-            logger.info(f"update_weights_from_zmq: loading {len(all_weights)} weight tensors via SHM")
+            atom_kwargs = (getattr(self.config, "engine_kwargs", {}) or {}).get(
+                "atom", {}
+            ) or {}
+            bucket_size_mb = atom_kwargs.get(
+                "bucket_size_mb", IPCConfig.DEFAULT_BUCKET_SIZE_MB
+            )
+            logger.info(
+                f"update_weights_from_zmq: loading {len(all_weights)} weight tensors via SHM"
+            )
             self.engine.load_weights(iter(all_weights), bucket_size_mb=bucket_size_mb)
             del all_weights
 
@@ -500,9 +530,9 @@ class ATOMHttpServer:
     async def clear_kv_cache(self):
         """Clear KV cache in the engine."""
         if self.engine is not None:
-            if hasattr(self.engine, 'core_mgr'):
-                self.engine.core_mgr.broadcast_utility_command('clear_kv_cache')
-            elif hasattr(self.engine, 'clear_kv_cache'):
+            if hasattr(self.engine, "core_mgr"):
+                self.engine.core_mgr.broadcast_utility_command("clear_kv_cache")
+            elif hasattr(self.engine, "clear_kv_cache"):
                 self.engine.clear_kv_cache()
 
     async def set_global_steps(self, global_steps: int):
@@ -550,11 +580,14 @@ class ATOMReplica(RolloutReplica):
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
     ):
-        super().__init__(replica_rank, config, model_config, gpus_per_node, is_reward_model)
+        super().__init__(
+            replica_rank, config, model_config, gpus_per_node, is_reward_model
+        )
         self.server_class = ray.remote(ATOMHttpServer)
 
     def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
         from verl.workers.rollout.atom_rollout.atom_rollout import ServerAdapter
+
         _rollout_worker_actor_cls = ray.remote(ServerAdapter)
         return RayClassWithInitArgs(
             cls=_rollout_worker_actor_cls,
@@ -564,9 +597,9 @@ class ATOMReplica(RolloutReplica):
         )
 
     async def launch_servers(self):
-        assert len(self.workers) == self.world_size, (
-            f"worker number {len(self.workers)} not equal to world size {self.world_size}"
-        )
+        assert (
+            len(self.workers) == self.world_size
+        ), f"worker number {len(self.workers)} not equal to world size {self.world_size}"
 
         # 1. Get (node_id, GPU accelerator ID) for each worker
         worker_infos = await asyncio.gather(
@@ -574,7 +607,9 @@ class ATOMReplica(RolloutReplica):
                 worker.__ray_call__.remote(
                     lambda self: (
                         ray.get_runtime_context().get_node_id(),
-                        ray.get_runtime_context().get_accelerator_ids()[get_resource_name()][0],
+                        ray.get_runtime_context().get_accelerator_ids()[
+                            get_resource_name()
+                        ][0],
                     )
                 )
                 for worker in self.workers
@@ -597,9 +632,11 @@ class ATOMReplica(RolloutReplica):
                     node_id=node_id,
                     soft=False,
                 ),
-                runtime_env={"env_vars": {
-                    "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
-                }},
+                runtime_env={
+                    "env_vars": {
+                        "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES": "1",
+                    }
+                },
                 name=name,
             ).remote(
                 config=self.config,
@@ -635,4 +672,6 @@ class ATOMReplica(RolloutReplica):
             else f"{server_address}:{server_port}"
         )
 
-        logger.info(f"ATOMReplica {self.replica_rank}: Server launched at {self._server_address}")
+        logger.info(
+            f"ATOMReplica {self.replica_rank}: Server launched at {self._server_address}"
+        )
