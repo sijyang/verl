@@ -26,7 +26,6 @@ from verl.workers.rollout.atom_rollout.constants import (
     IPCConfig,
     SleepLevel,
 )
-from verl.workers.rollout.atom_rollout.utils import get_device_uuid
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -62,6 +61,7 @@ class ATOMHttpServer:
         self.workers = workers
         self.replica_rank = replica_rank
         self.node_rank = node_rank
+        self.job_id = ray.get_runtime_context().get_job_id()
         self.gpus_per_node = gpus_per_node
         self.nnodes = nnodes
         self.engine = None
@@ -127,11 +127,15 @@ class ATOMHttpServer:
         from atom.sampling_params import SamplingParams
 
         max_tokens = sampling_params.pop("max_tokens", self.config.response_length)
+        if "max_new_tokens" in sampling_params:
+            max_tokens = sampling_params.pop("max_new_tokens")
         temperature = sampling_params.pop("temperature", ATOMDefaults.TEMPERATURE)
         return_logprobs = sampling_params.pop("logprobs", False)
+        top_k = sampling_params.pop("top_k", -1)
+        top_p = sampling_params.pop("top_p", 1.0)
+        n = sampling_params.pop("n", 1)
 
-        unsupported_keys = ("top_p", "top_k", "repetition_penalty", "max_new_tokens")
-        for key in unsupported_keys:
+        for key in ("repetition_penalty",):
             if key in sampling_params:
                 logger.debug(
                     f"Dropping unsupported sampling param: {key}={sampling_params.pop(key)}"
@@ -141,6 +145,9 @@ class ATOMHttpServer:
             max_tokens=max_tokens,
             temperature=temperature,
             logprobs=return_logprobs,
+            top_k=top_k,
+            top_p=top_p,
+            n=n,
         )
 
     def _build_engine_kwargs(self) -> dict[str, Any]:
@@ -175,6 +182,8 @@ class ATOMHttpServer:
         return engine_kwargs
 
     async def _launch_http_server(self):
+        import time as _time
+
         from fastapi import FastAPI, HTTPException
         from pydantic import BaseModel
 
@@ -184,6 +193,19 @@ class ATOMHttpServer:
             prompt_ids: list[int]
             sampling_params: dict[str, Any] = {}
             request_id: str = ""
+
+        class ChatMessage(BaseModel):
+            role: str
+            content: str
+
+        class ChatCompletionRequest(BaseModel):
+            model: str
+            messages: list[ChatMessage]
+            temperature: float = 1.0
+            top_p: float = 1.0
+            n: int = 1
+            max_tokens: int | None = None
+            logprobs: bool = False
 
         @app.post("/generate")
         async def generate_endpoint(request: GenerateRequest):
@@ -196,6 +218,107 @@ class ATOMHttpServer:
                 return result.model_dump()
             except Exception as e:
                 logger.error(f"Generate error: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        @app.post("/v1/chat/completions")
+        async def chat_completions(request: ChatCompletionRequest):
+            try:
+                tokenizer = self.model_config.tokenizer
+                messages = [{"role": m.role, "content": m.content} for m in request.messages]
+                prompt_ids = tokenizer.apply_chat_template(
+                    messages, add_generation_prompt=True, tokenize=True, return_dict=False
+                )
+
+                sampling_params = {
+                    "temperature": request.temperature,
+                    "top_p": request.top_p,
+                    "n": request.n,
+                    "logprobs": request.logprobs,
+                }
+                if request.max_tokens is not None:
+                    sampling_params["max_tokens"] = request.max_tokens
+
+                request_id = str(uuid4())
+                result = await self.generate(
+                    prompt_ids=prompt_ids,
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                )
+
+                output_text = tokenizer.decode(result.token_ids, skip_special_tokens=True)
+                finish_reason = "stop" if result.stop_reason in ("completed", "stop") else "length"
+
+                return {
+                    "id": f"chatcmpl-{request_id}",
+                    "object": "chat.completion",
+                    "created": int(_time.time()),
+                    "model": request.model,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "message": {"role": "assistant", "content": output_text},
+                            "finish_reason": finish_reason,
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": len(prompt_ids),
+                        "completion_tokens": len(result.token_ids),
+                        "total_tokens": len(prompt_ids) + len(result.token_ids),
+                    },
+                }
+            except Exception as e:
+                logger.error(f"Chat completion error: {e}", exc_info=True)
+                raise HTTPException(status_code=500, detail=str(e))
+
+        class ScoreRequest(BaseModel):
+            model: str
+            input: str
+            tokenize: bool = True
+
+        @app.post("/score")
+        async def score_endpoint(request: ScoreRequest):
+            """Score endpoint for discriminative reward model."""
+            import math
+
+            try:
+                tokenizer = self.model_config.tokenizer
+                if request.tokenize:
+                    prompt_ids = tokenizer.encode(request.input)
+                else:
+                    prompt_ids = tokenizer.encode(
+                        request.input, add_special_tokens=False
+                    )
+
+                sampling_params = {
+                    "max_tokens": 1,
+                    "temperature": 1.0,
+                    "logprobs": True,
+                }
+                request_id = str(uuid4())
+                result = await self.generate(
+                    prompt_ids=prompt_ids,
+                    sampling_params=sampling_params,
+                    request_id=request_id,
+                )
+
+                score = 0.0
+                if result.log_probs and len(result.log_probs) > 0:
+                    val = float(result.log_probs[0])
+                    if not (math.isnan(val) or math.isinf(val)):
+                        score = val
+
+                return {
+                    "id": f"score-{request_id}",
+                    "object": "score",
+                    "model": request.model,
+                    "score": score,
+                    "usage": {
+                        "prompt_tokens": len(prompt_ids),
+                        "total_tokens": len(prompt_ids) + 1,
+                    },
+                }
+            except Exception as e:
+                logger.error(f"Score error: {e}", exc_info=True)
                 raise HTTPException(status_code=500, detail=str(e))
 
         @app.get("/health")
@@ -244,22 +367,17 @@ class ATOMHttpServer:
 
             except Exception as e:
                 logger.error(f"Batch processor error: {e}", exc_info=True)
-                async with self._batch_lock:
-                    for _, _, _, future in self._pending_requests:
-                        if not future.done():
-                            future.set_exception(e)
-                    self._pending_requests = []
 
     async def _process_batch(self, batch: list[tuple]):
         """Process a batch of requests together, calling the engine directly."""
         all_prompts = []
+        all_sampling_params = []
         all_request_ids = []
         futures = []
 
-        first_sp = batch[0][1] if batch else None
-
         for prompt_ids, sp, request_id, future in batch:
             all_prompts.append(prompt_ids)
+            all_sampling_params.append(sp)
             all_request_ids.append(request_id)
             futures.append(future)
 
@@ -270,7 +388,7 @@ class ATOMHttpServer:
         def _generate_blocking():
             return self.engine.generate(
                 all_prompts,
-                first_sp,
+                all_sampling_params,
                 request_ids=all_request_ids,
             )
 
@@ -379,11 +497,8 @@ class ATOMHttpServer:
 
         ctx = zmq.Context()
         socket = ctx.socket(zmq.REP)
-        # Use device 0 since ATOMHttpServer's CUDA_VISIBLE_DEVICES
-        # is set to the exact GPUs for this replica
-        device_uuid = get_device_uuid(0)
-        zmq_handle = f"ipc:///tmp/rl-colocate-zmq-atom-{device_uuid}.sock"
-        socket.connect(zmq_handle)  # ServerAdapter binds, server connects
+        zmq_handle = f"ipc:///tmp/rl-colocate-zmq-atom-{self.job_id}-replica-{self.replica_rank}-rank-0.sock"
+        socket.connect(zmq_handle)
 
         # Receive IPC handle or shared memory metadata
         comm_metadata = socket.recv_pyobj()
@@ -519,7 +634,9 @@ class ATOMHttpServer:
             logger.info(
                 f"update_weights_from_zmq: loading {len(all_weights)} weight tensors via SHM"
             )
-            self.engine.load_weights(iter(all_weights), bucket_size_mb=bucket_size_mb)
+            self.engine.load_weights(
+                iter(all_weights), bucket_size_mb=bucket_size_mb, mode="shm"
+            )
             del all_weights
 
         logger.info("update_weights_from_zmq: load_weights completed")
@@ -579,22 +696,20 @@ class ATOMReplica(RolloutReplica):
         model_config: HFModelConfig,
         gpus_per_node: int = 8,
         is_reward_model: bool = False,
+        is_teacher_model: bool = False,
+        name_suffix: str = "",
     ):
         super().__init__(
-            replica_rank, config, model_config, gpus_per_node, is_reward_model
+            replica_rank, config, model_config, gpus_per_node, is_reward_model, is_teacher_model, name_suffix
         )
         self.server_class = ray.remote(ATOMHttpServer)
 
-    def get_ray_class_with_init_args(self) -> RayClassWithInitArgs:
-        from verl.workers.rollout.atom_rollout.atom_rollout import ServerAdapter
-
-        _rollout_worker_actor_cls = ray.remote(ServerAdapter)
-        return RayClassWithInitArgs(
-            cls=_rollout_worker_actor_cls,
-            config=self.config,
-            model_config=self.model_config,
-            device_mesh=None,
-        )
+    def _get_server_name_prefix(self) -> str:
+        if self.is_reward_model:
+            return "atom_server_reward"
+        elif self.is_teacher_model:
+            return "atom_server_teacher"
+        return "atom_server"
 
     async def launch_servers(self):
         assert (
@@ -625,7 +740,8 @@ class ATOMReplica(RolloutReplica):
             end = start + gpus_per_replica_node
             node_cuda_visible_devices = ",".join(worker_gpu_ids[start:end])
             node_id = worker_node_ids[start]
-            name = f"atom_server_{self.replica_rank}_{node_rank}"
+            prefix = self._get_server_name_prefix()
+            name = f"{prefix}_{self.replica_rank}_{node_rank}{self.name_suffix}"
 
             server = self.server_class.options(
                 scheduling_strategy=ray.util.scheduling_strategies.NodeAffinitySchedulingStrategy(
@@ -638,6 +754,7 @@ class ATOMReplica(RolloutReplica):
                     }
                 },
                 name=name,
+                max_concurrency=self.max_concurrency,
             ).remote(
                 config=self.config,
                 model_config=self.model_config,

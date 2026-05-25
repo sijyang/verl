@@ -247,6 +247,13 @@ class RewardLoopWorker:
             }
             output = await self._post_request(payloads, "v1/embeddings")
             rm_score = output["data"][-1]["embedding"][-1]
+        elif engine_name == "atom":
+            payloads = {
+                "model": model_name,
+                "input": disrm_prompt,
+            }
+            output = await self._post_request(payloads, "score")
+            rm_score = output["score"]
         elif engine_name == "trtllm":
             # TODO: remove this once TRT-LLM switches to TorchSampler
             raise ValueError("TensorRT-LLM backend does not support reward models currently.")
