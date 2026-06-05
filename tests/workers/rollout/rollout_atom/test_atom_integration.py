@@ -50,9 +50,7 @@ def _build_rollout_config(*, response_length=50, free_cache_engine=False):
     """Build rollout and model configs via Hydra compose."""
     from hydra import compose, initialize_config_dir
 
-    config_dir = os.path.abspath("verl/verl/trainer/config")
-    if not os.path.exists(config_dir):
-        config_dir = os.path.abspath("verl/trainer/config")
+    config_dir = os.path.abspath("verl/trainer/config")
 
     test_cfg = _get_test_config()
 
