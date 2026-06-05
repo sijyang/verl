@@ -152,10 +152,12 @@ class ATOMHttpServer:
 
     def _build_engine_kwargs(self) -> dict[str, Any]:
         """Build engine configuration dictionary."""
+        dp_master_port, _ = get_free_port(self._server_address)
         engine_kwargs = {
             "model": self.model_config.local_path,
             "tensor_parallel_size": self.config.tensor_model_parallel_size,
             "data_parallel_size": self.config.data_parallel_size,
+            "data_parallel_master_port": dp_master_port,
             "enable_expert_parallel": self.config.expert_parallel_size > 1,
             "max_num_seqs": self.config.max_num_seqs,
             "max_model_len": self.config.max_model_len,
@@ -481,19 +483,18 @@ class ATOMHttpServer:
     def _update_weights_from_zmq_sync(self, use_shm=False):
         """Synchronous ZMQ weight receive and engine weight load.
 
-        Weight transfer strategy:
-        - When use_shm=False (CUDA IPC): ATOMHttpServer opens the IPC handle
-          from ServerAdapter (same-GPU IPC on cuda:0, always safe), then
-          copies weight data to per-GPU buffers via D2D copy and distributes
-          per-GPU IPC handles to ModelRunner subprocesses. Each ModelRunner
-          opens ONLY its own GPU's handle — always same-GPU IPC, no cross-GPU
-          hipIpcOpenMemHandle. This avoids the ROCm/MI300X crash where opening
-          an IPC handle from a different physical GPU causes a "Memory access
-          fault".
-        - When use_shm=True (SHM fallback): weights are read from POSIX SHM,
-          copied to GPU, then distributed via engine.load_weights().
+        Receives weight buckets from ServerAdapter via ZMQ, then delegates
+        to engine.load_weights() which handles per-GPU IPC distribution
+        to ModelRunner subprocesses internally.
+
+        The IPC path opens the sender's IPC handle on cuda:0 (same-GPU,
+        always safe) and zero-copy views each weight tensor from the
+        mapped buffer. All cross-GPU distribution is handled inside
+        engine.load_weights(mode="ipc") via load_weights_via_ipc, which
+        allocates per-GPU buffers within the EngineCore process tree
+        where GPU visibility is correct.
         """
-        from torch.multiprocessing.reductions import reduce_tensor
+        from verl.workers.rollout.atom_rollout.bucketed_weight_transfer import rebuild_ipc
 
         ctx = zmq.Context()
         socket = ctx.socket(zmq.REP)
@@ -505,143 +506,69 @@ class ATOMHttpServer:
         socket.send(b"")
 
         if not use_shm:
-            # Per-GPU IPC path: open the IPC handle from ServerAdapter on
-            # cuda:0 (same-GPU, always safe), then replicate to per-GPU
-            # buffers and send per-GPU IPC handles to ModelRunners.
-            from atom.rollout.weight_sync import rebuild_ipc_handle
-
-            ipc_buffer = rebuild_ipc_handle(comm_metadata, device_id=0)
-            bucket_size = ipc_buffer.numel()
+            ipc_buffer = rebuild_ipc(comm_metadata, device_id=0)
             logger.info(
                 f"update_weights_from_zmq: opened IPC buffer "
-                f"(size={bucket_size} bytes, device={ipc_buffer.device})"
+                f"(size={ipc_buffer.numel()} bytes, device={ipc_buffer.device})"
             )
-
-            # Determine total number of GPUs used by this engine
-            tp_size = self.config.tensor_model_parallel_size
-            dp_size = self.config.data_parallel_size
-            num_gpus = tp_size * dp_size
-
-            # Allocate per-GPU buffers and create IPC handles
-            per_gpu_buffers = {}
-            per_gpu_ipc_handles = {}
-            for i in range(num_gpus):
-                buf = torch.empty(bucket_size, dtype=torch.uint8, device=f"cuda:{i}")
-                per_gpu_buffers[i] = buf
-                per_gpu_ipc_handles[i] = reduce_tensor(buf)
-            logger.info(
-                f"update_weights_from_zmq: allocated {num_gpus} per-GPU IPC "
-                f"buffers ({bucket_size / (1 << 20):.1f} MiB each)"
-            )
-
-            while True:
-                metadata = socket.recv_pyobj()
-                raw_bucket_meta = metadata["bucket_meta"]
-                is_last = metadata["is_last"]
-
-                # Convert bucket_meta from ZMQ format (dtype=torch.dtype, no nbytes)
-                # to weight_updater format (dtype=str, with nbytes)
-                bucket_meta = {}
-                used_bytes = 0
-                for name, meta in raw_bucket_meta.items():
-                    shape = meta["shape"]
-                    dtype = meta["dtype"]
-                    offset = meta["offset"]
-                    nbytes = dtype.itemsize * torch.Size(shape).numel()
-                    bucket_meta[name] = {
-                        "shape": tuple(shape),
-                        "dtype": str(dtype),
-                        "offset": offset,
-                        "nbytes": nbytes,
-                    }
-                    end = offset + nbytes
-                    if end > used_bytes:
-                        used_bytes = end
-
-                # D2D copy from cuda:0 IPC buffer to each per-GPU buffer
-                src_slice = ipc_buffer[:used_bytes]
-                for i in range(num_gpus):
-                    per_gpu_buffers[i][:used_bytes].copy_(src_slice, non_blocking=True)
-                # Synchronize all GPUs to ensure D2D copies are complete
-                for i in range(num_gpus):
-                    torch.cuda.synchronize(i)
-
-                # Send per-GPU IPC handles to ModelRunners
-                self.engine.core_mgr.broadcast_utility_command_sync(
-                    "update_weights_ipc",
-                    ipc_handle=None,
-                    ipc_handles=per_gpu_ipc_handles,
-                    bucket_meta=bucket_meta,
-                    is_last=is_last,
-                )
-
-                # ACK to ServerAdapter
-                socket.send(b"")
-                if is_last:
-                    break
-
-            socket.close()
-            ctx.term()
-
-            # Cleanup per-GPU buffers and IPC handles.
-            # CRITICAL: must call empty_cache() on EVERY GPU to return
-            # the 4 GB per-GPU IPC buffer memory to HIP.  Without this,
-            # PyTorch's caching allocator keeps the memory allocated,
-            # reducing available GPU memory for KV cache in ModelRunner
-            # subprocesses — which causes Memory access faults on
-            # memory-constrained GPUs (especially DP rank 1).
-            del per_gpu_buffers
-            del per_gpu_ipc_handles
-            del ipc_buffer
-            gc.collect()
-            torch.cuda.ipc_collect()
-            for i in range(num_gpus):
-                with torch.cuda.device(i):
-                    torch.cuda.empty_cache()
         else:
-            # SHM fallback: collect all weights to GPU, then use engine.load_weights()
             shm = shared_memory.SharedMemory(name=comm_metadata["name"])
-            buffer = torch.frombuffer(
+            ipc_buffer = torch.frombuffer(
                 shm.buf[: comm_metadata["size"]], dtype=torch.uint8
             )
-            all_weights = []
-            while True:
-                metadata = socket.recv_pyobj()
-                for name, meta in metadata["bucket_meta"].items():
-                    shape, dtype, offset = meta["shape"], meta["dtype"], meta["offset"]
+
+        all_weights = []
+        while True:
+            metadata = socket.recv_pyobj()
+            is_last = metadata["is_last"]
+            for name, meta in metadata["bucket_meta"].items():
+                shape = meta["shape"]
+                dtype = meta["dtype"]
+                offset = meta["offset"]
+                handle = meta.get("handle")
+                if handle is not None:
+                    tensor = rebuild_ipc(handle, 0)
+                else:
                     nbytes = dtype.itemsize * torch.Size(shape).numel()
-                    tensor = (
-                        buffer[offset : offset + nbytes].view(dtype=dtype).view(shape)
-                    )
-                    tensor = tensor.to("cuda:0")
-                    all_weights.append((name, tensor))
-                torch.cuda.synchronize()
-                socket.send(b"")
-                if metadata["is_last"]:
-                    break
+                    tensor = ipc_buffer[offset : offset + nbytes].view(dtype=dtype).view(shape)
+                    if use_shm:
+                        tensor = tensor.to("cuda:0")
+                    elif not is_last:
+                        tensor = tensor.clone()
+                all_weights.append((name, tensor))
+            torch.cuda.synchronize()
+            socket.send(b"")
+            if is_last:
+                break
 
-            socket.close()
-            ctx.term()
-            del buffer
+        socket.close()
+        ctx.term()
+
+        atom_kwargs = (getattr(self.config, "engine_kwargs", {}) or {}).get(
+            "atom", {}
+        ) or {}
+        bucket_size_mb = atom_kwargs.get(
+            "bucket_size_mb", IPCConfig.DEFAULT_BUCKET_SIZE_MB
+        )
+        logger.info(
+            f"update_weights_from_zmq: loading {len(all_weights)} weight tensors"
+        )
+        num_gpus = self.config.tensor_model_parallel_size * self.config.data_parallel_size
+        self.engine.load_weights(
+            iter(all_weights), bucket_size_mb=bucket_size_mb,
+            num_gpus=num_gpus, mode="ipc",
+        )
+
+        del all_weights
+        if use_shm:
+            del ipc_buffer
             shm.close()
-
-            atom_kwargs = (getattr(self.config, "engine_kwargs", {}) or {}).get(
-                "atom", {}
-            ) or {}
-            bucket_size_mb = atom_kwargs.get(
-                "bucket_size_mb", IPCConfig.DEFAULT_BUCKET_SIZE_MB
-            )
-            logger.info(
-                f"update_weights_from_zmq: loading {len(all_weights)} weight tensors via SHM"
-            )
-            self.engine.load_weights(
-                iter(all_weights), bucket_size_mb=bucket_size_mb, mode="shm"
-            )
-            del all_weights
+        else:
+            del ipc_buffer
+            torch.cuda.ipc_collect()
 
         logger.info("update_weights_from_zmq: load_weights completed")
         gc.collect()
-        torch.cuda.ipc_collect()
         torch.cuda.empty_cache()
 
     async def clear_kv_cache(self):
